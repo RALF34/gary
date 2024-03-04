@@ -3,13 +3,13 @@ from datetime import date, datetime, timedelta
 from statistics import mean
 
 from bson.code import Code
-from pandas import read_csv, read_excel
+from pandas import DataFrame, read_csv, read_excel
 from pymongo import MongoClient
 
 from .constants import FRENCH_DEPARTMENTS
 
-mongoClient = MongoClient("mongodb://db:27017")
-database = mongoClinet["air_quality"]
+mongoClient = MongoClient() #"mongodb://db:27017"
+database = mongoClient["air_quality"]
 
 stringToDatetime = lambda x: datetime.strptime(x,"%Y/%m/%d %H:%M:%S")
 
@@ -38,8 +38,7 @@ def store_locations():
     regarding location in France of all the stations owned by the
     Central Laboratory of Air Quality Monitoring (LCSQA).
     '''
-    database = mongoClient["air_quality"]
-    url = "https://www.lcsqa.org/system/files/media/documents/"+
+    url = "https://www.lcsqa.org/system/files/media/documents/"+\
     "Liste points de mesures 2021 pour site LCSQA_27072022.xlsx"
     # Import file from previous url giving location of LCSQA stations.
     data = read_excel(url.replace(" ", "%20"), sheet_name=1)
@@ -55,8 +54,8 @@ def store_locations():
     ).set_axis(
         labels_to_keep,
         axis="columns")
-    # Define a function "get_department" to retrieve names of French departments
-    # using postal codes of french cities.
+    # Define a function "get_department" to retrieve names of French
+    # departments using postal codes of french cities.
     get_department = lambda x: (
         FRENCH_DEPARTMENTS[x[:2]] if not(x[1].isdigit()) or int(x[:2]) < 97
         else FRENCH_DEPARTMENTS[x[:3]]
@@ -75,14 +74,15 @@ def store_locations():
     database["LCSQA_stations"].insert_many(data.to_dict("records"))
 
 
-def store_pollution_data(n_days, name):
+def store_pollution_data(n_days, update=False):
     '''
-    Create a mongoDB collection storing hourly average concentrations 
-    of air pollutants recorded by LCSQA stations.
+    Create two collections storing hourly average concentrations of 
+    air pollutants recorded on working days and weekends.
 
     Arguments:
     n_days -- number of last pollution days whose data are collected.
-    name -- name of the collection storing the collected data.
+    update -- boolean used to determine the names of the collections
+              storing the pollution data.
     '''
 
     DATE = date.today() - timedelta(days=n_days)
@@ -105,15 +105,30 @@ def store_pollution_data(n_days, name):
             data["pollutant_to_ignore"] = data["Polluant"].apply(
                 lambda x: x in ["NO","NOX as NO2","C6H6"])
             data = data[data["pollutant_to_ignore"]==False]
-            # Turn pandas dataframe into records.
-            records = data.to_dict("records")
-            # Iterate over each row to add new fields "dateTime" and "hour".
-            for r in records:
-                r["dateTime"] = stringToDatetime(r["Date de début"])
-                r["hour"] = r["dateTime"].hour
-                r.pop("Date de début")
-            # Move data into the"LCSQA_data" collection.
-            database[name].insert_many(records)
+            data["dateTime"] = data["Date de début"].apply(
+                lambda x: stringToDatetime(x))
+            data["hour"] = data["Date de début"].apply(
+                lambda x: x.hour)
+            data["working_days"] = data["dateTime"].apply(
+                lambda x: x.weekday())
+            data = data[
+                ["code site",
+                "Polluant",
+                "hour"
+                "valeur brute",
+                "dateTime",
+                "working_days"]]
+            # Separate the data recorded on working days from
+            # those recorded on weekends.
+            working_days = data[data["working_days"]]
+            weekends = data[data["working_days"]==False]
+            names = ("working_days","weekends") if not(update) \
+            else ("new_working_days","new_weekends")
+            # Update the appropriate collection.
+            database[names[0]].insert_many(
+                working_days.to_dict("records"))
+            database[names[1]].insert_many(
+                weekends.to_dict("records"))
         # Move on to the following day.
         DATE += timedelta(days=1)
 
@@ -124,9 +139,12 @@ def create_database():
         - "cities", grouping air quality monitoring stations by cities.
         - "departments", grouping cities by French department.
         - "regions", grouping French departments by French region.
-        - "LCSQA_data", containing air pollution data collected over the last 180 days.
+        - "LCSQA_data", containing air pollution data collected over 
+           the last 180 days.
     '''
-
+    if "air_quality" in mongoClient.list_database_names():
+        mongoClient.drop_database("air_quality")
+    database = mongoClient["air_quality"]
     # Create the "LCSQA_stations" collection.
     store_locations()
     # Create the "cities" collection using "LCSQA_stations".
@@ -153,36 +171,39 @@ def create_database():
     # Remove the "LCSQA_stations" intermediate collection.
     database.drop_collection("LCSQA_stations")
     
-    # Create the "LCSQA_data" collection.
-    store_pollution_data(180,"LCSQA_data")
-    # Create the "distribution_pollutants" collection using "LCSQA_data".
-    database["LCSQA_data"].aggregate([
+    # Create the "working_days" and "weekends" collections.
+    store_pollution_data(7)
+    # Create the "distribution_pollutants" collection giving, for
+    # each station, the pollutant(s) whose air concentration is 
+    # being recorded.
+    database["working_days"].aggregate([
         {"$group":
             {"_id": "$code site",
              "monitored_pollutants":
                 {"$push": "$Polluant"}}},
         {"$out": "distribution_pollutants"}])
-    # Group data in "LCSQA_data" to allow computation of wanted
-    # averages (see function "get_values") and fast updates of
-    # the database (see function "update_database").
-    database["LCSQA_data"].aggregate([
-        {"$group":
-            {"_id": {"station": "$code site",
-                     "pollutant": "$Polluant",
-                     "hour": "$hour"},
-             "values": {"$push": "$valeur brute"},
-             "dates": {"$push": "$dateTime"}}},
-        {"$project":
-            {"history": {"values": "$values",
-                         "dates": "$dates"}}},
-        {"$out": "LCSQA_data"}])
-    # Since the present application will be deployed using Docker containers, we     
-    # can't update the history of data in a continuous way. We have to keep track of
-    # the date when the last update occured, in order to know how many days we will
-    # have to add to the history when performing the next update.
-    # So I store this information (given by the "DATE" variable) in a new collection.
+    # Group the pollution data to allow fast calculation of the 
+    # wanted averages (see function "get_values") and fast updates 
+    # of the database (see function "update_database").
+    for name in ["working_days","weekends"]:
+        database[name].aggregate([
+            {"$group":
+                {"_id": {"station": "$code site",
+                         "pollutant": "$Polluant",
+                         "hour": "$hour"},
+                 "values": {"$push": "$valeur brute"},
+                 "dates": {"$push": "$dateTime"}}},
+            {"$project":
+                {"history": {"values": "$values",
+                             "dates": "$dates"}}},
+            {"$out": name}])
+    # Save the current date in a new collection "last_update" 
+    # (necessary to know how many pollution days are missing
+    # when performing the next update).
+    DATE = date.today()
     database["last_update"].insert_one(
-        {"date": datetime(DATE.year, DATE.month, DATE.day)-timedelta(days=1)})
+        {"date": datetime(
+            DATE.year, DATE.month, DATE.day)-timedelta(days=1)})
 
 def update_database():
     '''
@@ -191,47 +212,51 @@ def update_database():
     '''
     # Retrieve the date when the last update occured.
     last_update = database["last_update"].find_one()["date"]
-    # Found the number of pollution days (given by "n_days") whose data we want to 
-    # add to the database.
+    # Found the number of pollution days (given by "n_days")
+    # whose data we want to add to the database.
     following_date = last_update.date() + timedelta(days=1)
     oldest_date = date.today() - timedelta(days=180)
     DATE = following_date if oldest_date < following_date \
     else oldest_date
     n_days = (date.today()-DATE).days
-    # Fill the "new_data" collection with the missing data.
-    store_pollution_data(n_days, "new_data")
-    # Rearrange the data the same way as in the "LCSQA_data" collection.
-    database["new_data"].aggregate([
-        {"$match": {"validité": 1}},
-        {"$project": {"_id": {"station": "$code site",
-                              "pollutant": "$Polluant",
-                              "hour": "$hour"},
-                      "history": {"date": "$dateTime",
-                                  "value": "$valeur brute"}}}])
-    # Join the "LCSQA_data" collection with the "new_data" collection (line 217),
-    # then update the history of pollution data (line 222) and then update the
-    # boolean flags identifying the last values of the new history (line 230).
-    database["LCSQA_data"].aggregate([
-        {"$lookup": 
-            {"from": "new_data",
-             "localField": "_id",
-             "foreignField": "_id",
-             "as": "new_data"}},
-        {"$set":
-            {"history":
-                {"$function": 
-                    {"body": updateList,
-                     "args": ["$history",
-                              "$data_180_days_ago",
-                              "$new_data"],
-                     "lang": "js"}}}},
-        {"$set":
-            {"data_180_days_ago":
-                {"$eq": ["history.dates.$",
-                        date.today()-timedelta(days=180)]}}},
-        {"$out": "LCSQA_data"}])
-    # Remove the "new_data" collection from the database.
-    database.drop_collection("new_data")
+    # Create the "new_working_days" and "new_weekends" collections
+    # storing the missing data.
+    store_pollution_data(n_days, update=True)
+    # Rearrange the data the same way as in the "working_days" and
+    # "weekends" collections.
+    for name in ["new_working_days","new_weekends"]:
+        database[name].aggregate([
+            {"$match": {"validité": 1}},
+            {"$project": {"_id": {"station": "$code site",
+                                  "pollutant": "$Polluant",
+                                  "hour": "$hour"},
+                          "history": {"date": "$dateTime",
+                                      "value": "$valeur brute"}}}])
+        # Join the collection containing the current data with the one 
+        # containing the new data (line 239), update the history (line 245)
+        # and update the boolean flags identifying the last values of the
+        # new history (line 253).
+        database[name[4:]].aggregate([
+            {"$lookup": 
+                {"from": name,
+                 "localField": "_id",
+                 "foreignField": "_id",
+                 "as": name}},
+            {"$set":
+                {"history":
+                    {"$function": 
+                        {"body": updateList,
+                         "args": ["$history",
+                                  "$data_180_days_ago",
+                                  "$"+name],
+                         "lang": "js"}}}},
+            {"$set":
+                {"data_180_days_ago":
+                    {"$eq": ["history.dates.$",
+                            date.today()-timedelta(days=180)]}}},
+            {"$out": name[4:]}])
+        # Remove the collection used to store the new data.
+        database.drop_collection("new_data")
     # Change the date of the last update.
     database["last_update"].replace_one(
         {"date": last_update},
@@ -251,7 +276,7 @@ def history_is_updated():
     return database["last_update"].find_one()["date"] == \
     datetime(DATE.year, DATE.month, DATE.day) - timedelta(days=1)
 
-def is_monitored_by(pollutant, station_code):
+def is_monitored_by(pollutant, station):
     '''
     Test whether air concentration of "pollutant" is recorded by the
     air quality monitoring station identified by "station_code".
@@ -266,42 +291,43 @@ def get_values(station, pollutant, n_days):
     Query the "LCSQA_data" collection to retrieve average values of 
     air concentration (calculated over the "n_days" last days with
     data coming from "station") of "pollutant" associated to each 
-    of the 24 hours of the day.
+    of the 24 hours of both working days and week-end days.
     '''
     DATE = date.today()
     DATETIME = datetime(DATE.year, DATE.month, DATE.day)
-    # Initialize the "averages" dictionary storing the average values
-    # of air concentration associated to the 24 hours of the day.
-    averages = {str(x): float(0) for x in range(24)}
+    working_days, weekends = [{str(x): float(0) for x in range(24)}]*2
+    query_filter = {"_id.station": station, "_id.pollutant": pollutant}
     # Check whether "n_days" is not null (the zero value is used when
-    # we just send the web request to allow an update of the database).
+    # we send the web request only to allow an update of the database).
     if n_days:
         # Retrieve all the documents with the wanted informations.
-        data = database["LCSQA_data"].find(
-            {"_id.station": station,
-             "_id.pollutant": pollutant})
-    # Check whether some documents have been found.
-    if data:
-        # Iterate over all the documents.
-        for document in data:
-            # Retrieve the hour when the data given by the current document 
-            # have been recorded.
-            hour = document["_id"]["hour"]
-            # Build the "history" list composed of the 
-            #(recorded_concentration-recording date) pair of values, ordered
-            # from the most recent date to the oldest.
-            history = list(zip(
-                document["history"]["values"],
-                document["history"]["dates"]))[::-1]
-            # Extract only elements of "history" with a date less than "n_days"
-            # days before the current date (the last element to consider is given
-            # by the "i" variable at the end of the "while" loop).
-            i = 0
-            duration = DATETIME - history[i][1]
-            while duration.days <= n_days:
-                i += 1
+        working_days = database["working_days"].find(query_filter)
+        weekends = database["weekends"].find(query_filter)
+    for name in ["working_days","weekends"]:
+        data = database[name].find(query_filter)
+        # Check whether some data have been found.
+        if data:
+            # For each hour of the day retrieved from a document,
+            # calculate the expected averages and update the
+            # "working_days and week_end" dictionaries.
+            for document in data:
+                hour = document["_id"]["hour"]
+                # Build list "history" with the (concentration,date) 
+                # pair of values, ordered from the most recent date
+                # to the oldest.
+                history = list(zip(
+                    document["history"]["values"],
+                    document["history"]["dates"]))[::-1]
+                # Extract only elements of "history" with a date less 
+                # than "n_days" days before the current date (the last 
+                # element to consider is given by the "i" variable at 
+                # the end of the "while" loop) and update the appropriate 
+                # dictionary with the wanted average.
+                i = 0
                 duration = DATETIME - history[i][1]
-            # Compute the mean of the retrieved values and update the "averages"
-            # dictionary accordingly.
-            averages[str(hour)] = float(mean([e[0] for e in history[:i]]))
-    return list(averages.values())
+                while duration.days <= n_days:
+                    i += 1
+                    duration = DATETIME - history[i][1]
+                averages[str(hour)] = float(mean([e[0] for e in history[:i]]))
+            
+    return list(working_days.values()), list(weekends.values())

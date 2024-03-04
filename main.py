@@ -16,10 +16,15 @@ create_database()
 # returned by the API which will appear in the automatic 
 # documentation).
 class averageConcentrations(BaseModel):
-    values: list[float] = Field(
+    working_days: list[float] = Field(
         description="The average values of air concentration of the given pollutant \
         calculated for each of the 24 hours of the day (set to 0 when not enough data)\
-        with data recorded by the given station over the given period."
+        with data recorded by the given station, over the given period and on working\
+        days only."
+    )
+    weekends : list[float] = Field(
+        description="The same averages values as previously described, but involving\
+        pollution data recorded on saturday and sunday only"
     )
 
 # Retrieve all the "LCSQA" station codes (will be used at line 60
@@ -28,8 +33,7 @@ url = "https://www.lcsqa.org/system/files/media/documents/"+\
 "Liste points de mesures 2021 pour site LCSQA_27072022.xlsx"
 LCSQA_stations = read_excel(
     url.replace(" ", "%20"),
-    sheet_name=1
-).iloc[:,0][2:].tolist()
+    sheet_name=1).iloc[:,0][2:].tolist()
 
 # Define the only endpoint of the API, that is a "GET" method
 # returning the expected 24 average values of air concentration.
@@ -56,7 +60,7 @@ async def get_response(
             alias="n",
             description=(
                 "Parameter telling the API that we are interested in\
-                 pollution data recorded over the 'n_days' last days.")
+                 pollution data recorded over the 'n_days' last days."),
             pattern="\d+")]):
     # Notify an error when the given station does not exist.
     if station not in LCSQA_stations:
@@ -75,4 +79,6 @@ async def get_response(
     # Update the database if necessary.
     if not(history_is_updated):
         update_database()
-    return {"values": get_values(station, pollutant, int(n_days))}
+    # Return the expected values.
+    working_days, weekends = get_values(station, pollutant, int(n_days))
+    return {"working_days": working_days, "weekends": weekends}
